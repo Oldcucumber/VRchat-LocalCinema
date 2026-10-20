@@ -717,7 +717,8 @@ mod tests {
         };
         let a = probe_args("movie.mkv", &o, Some(Path::new("sub.ass")), 20.0, 45);
         let text = a.join(" ");
-        assert!(text.contains("libaom-av1"));
+        assert!(text.contains("libsvtav1"));
+        assert!(!text.contains("-keyint_min") && !text.contains("-sc_threshold"));
         assert!(text.contains("subtitles=sub.ass"));
         assert!(text.contains("-f null -"));
         assert!(!text.contains("-map 0:2"));

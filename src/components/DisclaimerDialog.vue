@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { AlertTriangle } from 'lucide-vue-next'
 import Dialog from './ui/Dialog.vue'
 import Button from './ui/Button.vue'
 import Separator from './ui/Separator.vue'
@@ -63,28 +62,11 @@ function handleOpenChange(open: boolean) {
   }
   emit('update:open', open)
 }
-
-import type { ComponentProps } from 'vue'
-type DialogProps = ComponentProps<typeof Dialog>
-
-const dialogProps = computed<DialogProps>(() => ({
-  open: props.open,
-  onOpenChange: handleOpenChange,
-}))
 </script>
 
 <template>
-  <Dialog v-bind="dialogProps">
+  <Dialog :open="props.open" title="免责声明" @update:open="handleOpenChange">
     <div class="sm:max-w-xl">
-      <div class="flex items-start gap-4">
-        <AlertTriangle class="mt-1 h-5 w-5 shrink-0 text-amber-600" />
-        <div class="flex-1">
-          <h2 class="text-lg font-semibold">免责声明</h2>
-        </div>
-      </div>
-
-      <Separator class="my-4" />
-
       <div class="max-h-[60vh] space-y-3 overflow-y-auto pr-4 text-sm leading-relaxed text-muted-foreground">
         <section>
           <h3 class="mb-1.5 font-medium text-foreground">1. 软件声明</h3>

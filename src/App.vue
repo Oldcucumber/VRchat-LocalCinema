@@ -15,10 +15,10 @@ import Button from './components/ui/Button.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import Switch from './components/ui/Switch.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
-import { initStore, serverStore, mediaStore, importMediaPaths, faststartHintState, transcodeStreamingItem, loadSettings, settingsCache } from './lib/store'
+import { initStore, serverStore, importMediaPaths, faststartHintState, transcodeStreamingItem, loadSettings, settingsCache } from './lib/store'
 import { formatSize } from './lib/format'
 import { toast, errMsg } from './lib/toast'
-import { isFirstLaunch, markDisclaimerAccepted, isRunningInTempDir, quitApp, hideToTray, onCloseRequested, saveSettings, type CloseBehavior, type MediaItem, type ListenMode } from './lib/api'
+import { isFirstLaunch, markDisclaimerAccepted, isRunningInTempDir, quitApp, hideToTray, onCloseRequested, saveSettings, type CloseBehavior, type MediaItem, type ListenMode, type StreamingProfile } from './lib/api'
 
 const router = useRouter()
 const appWindow = isTauri() ? getCurrentWindow() : null
@@ -241,11 +241,11 @@ function onCloseAskUpdate(open: boolean) {
 
 // 导入含 ≥2GB 大文件的批次时提示可一键压制
 const compressingId = ref('')
-async function compressLargeItem(item: MediaItem) {
+async function compressLargeItem(item: MediaItem, profile: StreamingProfile = 'av1') {
   if (compressingId.value) return
   compressingId.value = item.id
   try {
-    await transcodeStreamingItem(item)
+    await transcodeStreamingItem(item, profile)
     toast.info('已加入压制队列，完成后请使用新媒体卡片')
   } catch (e) {
     toast.error(errMsg(e))
@@ -529,12 +529,15 @@ onUnmounted(() => {
     >
       <div class="space-y-4">
         <div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-          压制为 AV1 + AAC 的 MP4：保持原始分辨率（仅高于 1080P 时降到 1080P），原文件保留，压制结果作为新卡片加入媒体库。码率上限与画质可在「设置 · 一键压制」中调整。
+          省流模式使用 AV1 + AAC；朋友缺少解码器或不确定对方环境时，建议兼容模式（H.264 + AAC）。两者均保留原片、不放大画面，并限制到 1920×1080 以内；兼容模式最高 30fps。码率与 AV1 速度可在「设置 · 一键压制」中调整。
         </div>
         <div class="max-h-56 space-y-2 overflow-y-auto rounded-md border border-border p-3">
           <div v-for="item in faststartHintState.largeItems" :key="item.id" class="flex items-center justify-between gap-3">
             <span class="min-w-0 truncate text-sm">{{ item.title }}<span class="text-muted-foreground"> · {{ formatSize(item.fileSize) }}</span></span>
-            <Button size="sm" :disabled="compressingId !== ''" @click="compressLargeItem(item)">一键压制</Button>
+            <div class="flex shrink-0 gap-2">
+              <Button size="sm" variant="outline" :disabled="compressingId !== ''" @click="compressLargeItem(item, 'av1')">省流 AV1</Button>
+              <Button size="sm" :disabled="compressingId !== ''" @click="compressLargeItem(item, 'compatible')">兼容 H.264</Button>
+            </div>
           </div>
         </div>
         <div class="flex justify-end gap-2">

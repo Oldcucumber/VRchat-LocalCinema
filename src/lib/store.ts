@@ -20,6 +20,7 @@ import {
   type Settings,
   type TunnelStatus,
   type ConvertTask,
+  type StreamingProfile,
 } from './api'
 
 export const serverStore = reactive<ServerStatus>({
@@ -146,15 +147,9 @@ export function removeMediaItem(id: string) {
 /// 导入成功后的压制提示状态
 export const faststartHintState = reactive({ batch: 0, largeItems: [] as MediaItem[], dialogOpen: false })
 
-/// 一键压制为流媒体 MP4（默认 SVT-AV1）：不主动提升分辨率与码率——
-/// 仅在源高于 1080p 时降采样到 1080p，否则保持原始分辨率；
-/// 码率以设置为上限（按源分辨率选 720/1080 档），实际由 CRF 决定。
-export async function transcodeStreamingItem(item: MediaItem): Promise<ConvertTask> {
-  const settings = await loadSettings()
-  const h = item.height ?? 0
-  const resolution: 'original' | '1080' = h > 1080 ? '1080' : 'original'
-  const mbps = h > 0 && h <= 720 ? settings.streaming720pBitrateMbps : settings.streaming1080pBitrateMbps
-  return transcodeStreamingCopy(item.id, resolution, mbps)
+/// 一键压制为流媒体 MP4（默认 SVT-AV1），也可选择兼容 H.264；实际约束由后端统一处理。
+export async function transcodeStreamingItem(item: MediaItem, profile: StreamingProfile = 'av1'): Promise<ConvertTask> {
+  return transcodeStreamingCopy(item.id, profile)
 }
 
 export async function importMediaPaths(paths: string[]): Promise<MediaItem[]> {

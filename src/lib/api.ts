@@ -60,6 +60,11 @@ export interface Settings {
   streaming720pBitrateMbps: number
   /** 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数） */
   streaming1080pBitrateMbps: number
+  streamingAv1Preset: number
+  streamingAutoResolution: boolean
+  compatiblePreset: 'medium' | 'slow'
+  compatible720pBitrateMbps: number
+  compatible1080pBitrateMbps: number
   easytier: EasytierConfig
 }
 
@@ -325,6 +330,8 @@ export function getMediaStreams(id: string): Promise<MediaStreamInfo[]> {
 
 /** 转码配置：字段缺省时按「自动」处理（与后端 TranscodeOptions 一一对应） */
 export interface TranscodeOptions {
+  /** 一键压制预设；后端统一生成实际参数，普通转码留空 */
+  streamingProfile?: StreamingProfile | null
   /** 视频流绝对索引；null = 第一路视频 */
   videoStream?: number | null
   /** 音频流绝对索引；null = 第一路音频 */
@@ -405,22 +412,15 @@ export function transcodeMedia(
 ): Promise<ConvertTask> {
   return invoke('transcode_media', { id, overwrite, options })
 }
-/** 一键压制为流媒体 MP4：默认 AV1（体积更小且可播放）。
- *  不提升分辨率（仅在源高于 1080p 时降采样）、不强制音频采样率；
- *  码率由 CRF 决定，设置为「不高于」的上限。 */
+export type StreamingProfile = 'av1' | 'compatible'
+
+/** 复用转码队列，实际预设与片源约束由后端统一生成。 */
 export function transcodeStreamingCopy(
   id: string,
-  resolution: 'original' | '1080',
-  maxrateMbps: number
+  profile: StreamingProfile = 'av1'
 ): Promise<ConvertTask> {
-  const kbps = Math.max(1, Math.round(maxrateMbps * 1000))
   return invoke('transcode_media', {
-    id, overwrite: false, options: {
-      videoMode: 'av1', audioMode: 'aac', includeAudio: true, subtitleMode: 'drop',
-      resolution, crf: 28, preset: '10', pixFmt: 'yuv420p',
-      audioBitrate: '160k', audioChannels: 2, faststart: true,
-      maxVideoBitrate: `${kbps}k`, videoBufferSize: `${kbps * 2}k`,
-    } satisfies TranscodeOptions,
+    id, overwrite: false, options: { streamingProfile: profile } satisfies TranscodeOptions,
   })
 }
 export function transcodeOutputExists(id: string, kind?: 'transcode' | 'segment'): Promise<boolean> {

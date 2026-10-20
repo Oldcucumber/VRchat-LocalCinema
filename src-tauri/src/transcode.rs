@@ -31,6 +31,13 @@ pub const SIDECAR_SUBTITLE_EXTS: &[(&str, &str)] = &[
 /// `index >= SIDECAR_INDEX_BASE` 即可区分「旁边的字幕文件」与内嵌字幕轨。
 pub const SIDECAR_INDEX_BASE: usize = 10_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamingProfile {
+    Av1,
+    Compatible,
+}
+
 /// 转码配置（字段缺省时按「自动」处理）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -49,7 +56,7 @@ pub struct TranscodeOptions {
     pub subtitle_graphic: Option<bool>,
     /// 视频处理：copy / h264 / h265 / av1
     pub video_mode: Option<String>,
-    /// 目标分辨率高度：original / 2160 / 1440 / 1080 / 720 / 480
+    /// 目标分辨率：original / 高度数字；一键压制使用不放大的 fit1080 / fit720 / fit480。
     pub resolution: Option<String>,
     /// 质量（CRF，0-51，越小越清晰）
     pub crf: Option<u32>,
@@ -73,6 +80,196 @@ pub struct TranscodeOptions {
     pub video_buffer_size: Option<String>,
     /// 闭合 GOP 的目标最大帧数
     pub keyframe_interval: Option<u32>,
+    /// 一键压制预设；普通转码留空，沿用原有参数与命名
+    pub streaming_profile: Option<StreamingProfile>,
+    /// 固定输出帧率（兼容模式或可选低码率自动调整启用时最高 30fps）
+    pub frame_rate: Option<String>,
+    /// HDR10 / HLG 转 SDR；仅在探测到明确 HDR 元数据时启用
+    pub tone_map: bool,
+    /// 无音轨输入补静音，使产物满足单视频 + 单 AAC 音轨的播放约定
+    pub silent_audio: bool,
+}
+
+/// 统一生成一键压制参数，所有前端入口共用；不根据分享者本机推断朋友的解码能力。
+pub fn streaming_options(
+    profile: StreamingProfile,
+    json: &serde_json::Value,
+    settings: &crate::settings::Settings,
+) -> Result<TranscodeOptions, String> {
+    let streams = parse_streams(json);
+    let video_index = default_video_stream(&streams).ok_or("未检测到可压制的视频轨")?;
+    let video = json["streams"].as_array()
+        .and_then(|streams| streams.iter().find(|s| s["index"].as_u64() == Some(video_index as u64)))
+        .ok_or("缺少视频轨信息")?;
+    if video["side_data_list"].as_array().is_some_and(|data| data.iter().any(|s| {
+        s["side_data_type"].as_str().unwrap_or("").to_ascii_lowercase().contains("dovi")
+    })) {
+        return Err("一键压制暂不支持 Dolby Vision，请使用经验证的 SDR 片源或高级转码流程".into());
+    }
+    let tone_map = matches!(video["color_transfer"].as_str(), Some("smpte2084" | "arib-std-b67"));
+    if video["color_primaries"].as_str() == Some("bt2020") && !tone_map {
+        return Err("片源使用 BT.2020，但无法确认 HDR 类型；请先转换为 SDR，避免压制后颜色异常".into());
+    }
+    let rate = ["avg_frame_rate", "r_frame_rate"]
+        .into_iter()
+        .filter_map(|key| video[key].as_str())
+        .find(|rate| parse_frame_rate(rate).is_some())
+        .unwrap_or("0/0");
+    let fps = parse_frame_rate(rate);
+    let compatible = profile == StreamingProfile::Compatible;
+    // 按源画面缩入 1080P 后的像素量选择预算，兼顾竖屏与超宽片源。
+    let width = video["width"].as_f64().filter(|v| *v > 0.0).unwrap_or(1920.0);
+    let height = video["height"].as_f64().filter(|v| *v > 0.0).unwrap_or(1080.0);
+    let scale = (1920.0 / width).min(1080.0 / height).min(1.0);
+    let small = width * height * scale * scale <= 1280.0 * 720.0;
+    let (mbps, fallback) = match (profile, small) {
+        (StreamingProfile::Av1, true) => (settings.streaming_720p_bitrate_mbps, 3.0),
+        (StreamingProfile::Av1, false) => (settings.streaming_1080p_bitrate_mbps, 6.0),
+        (StreamingProfile::Compatible, true) => (settings.compatible_720p_bitrate_mbps, 4.0),
+        (StreamingProfile::Compatible, false) => (settings.compatible_1080p_bitrate_mbps, 8.0),
+    };
+    let mbps = if mbps.is_finite() {
+        mbps.clamp(1.0, if compatible { 50.0 } else { 100.0 })
+    } else {
+        fallback
+    };
+    let kbps = (mbps * 1000.0).round() as u32;
+    let low_rate = settings.streaming_auto_resolution && kbps <= 3000;
+    let frame_rate = (compatible || low_rate).then(|| {
+        if fps.is_some_and(|fps| fps <= 30.0) {
+            rate.to_string()
+        } else {
+            "30".into()
+        }
+    });
+    let output_fps = if compatible || low_rate {
+        Some(fps.unwrap_or(30.0).min(30.0))
+    } else {
+        fps
+    };
+    let preset = match settings.streaming_av1_preset {
+        6 | 8 | 10 => settings.streaming_av1_preset,
+        _ => 8,
+    };
+    let resolution = if settings.streaming_auto_resolution && compatible && kbps <= 1500 {
+        "fit480"
+    } else if settings.streaming_auto_resolution && (kbps <= 2000 || (compatible && kbps <= 3000)) {
+        "fit720"
+    } else {
+        "fit1080"
+    };
+    let audio_stream = default_audio_stream(&streams);
+    Ok(TranscodeOptions {
+        streaming_profile: Some(profile),
+        video_stream: Some(video_index),
+        audio_stream,
+        video_mode: Some(if compatible { "h264" } else { "av1" }.into()),
+        audio_mode: Some("aac".into()),
+        include_audio: Some(true),
+        subtitle_mode: Some("drop".into()),
+        resolution: Some(resolution.into()),
+        crf: Some(if compatible { 22 } else { 28 }),
+        preset: Some(if compatible {
+            match settings.compatible_preset.as_str() {
+                "medium" => "medium".into(),
+                _ => "slow".into(),
+            }
+        } else { preset.to_string() }),
+        pix_fmt: Some("yuv420p".into()),
+        audio_bitrate: Some(if kbps <= 3000 { "128k" } else { "160k" }.into()),
+        audio_channels: Some(2),
+        audio_sample_rate: compatible.then_some(48000),
+        faststart: Some(true),
+        frame_rate,
+        tone_map,
+        silent_audio: audio_stream.is_none(),
+        max_video_bitrate: Some(format!("{}k", kbps)),
+        // SVT 的 capped CRF 不使用 x264 VBV 缓冲语义，不传无效的 bufsize。
+        video_buffer_size: compatible.then(|| format!("{}k", (kbps * 2).min(62500))),
+        keyframe_interval: output_fps.map(|fps| (fps * 2.0).ceil().clamp(1.0, 600.0) as u32),
+        ..Default::default()
+    })
+}
+
+fn parse_frame_rate(rate: &str) -> Option<f64> {
+    let fps = if let Some((n, d)) = rate.split_once('/') {
+        n.parse::<f64>().ok()? / d.parse::<f64>().ok()?
+    } else {
+        rate.parse().ok()?
+    };
+    (fps.is_finite() && fps > 0.0).then_some(fps)
+}
+
+pub fn output_label(options: &TranscodeOptions) -> &'static str {
+    match options.streaming_profile {
+        Some(StreamingProfile::Av1) => "省流 AV1",
+        Some(StreamingProfile::Compatible) => "兼容 H264",
+        None => "转码",
+    }
+}
+
+/// 仅在用户提交一键压制时探测，不为每张媒体卡片反复启动 FFmpeg。
+pub async fn check_streaming_capabilities(
+    ffmpeg: &Path,
+    options: &TranscodeOptions,
+) -> Result<(), String> {
+    let encoder = if options.video_mode() == "av1" { "libsvtav1" } else { "libx264" };
+    let mut filters = vec!["scale"];
+    if options.tone_map {
+        filters.extend(["zscale", "tonemap", "sidedata"]);
+    }
+    if options.silent_audio {
+        filters.push("anullsrc");
+    }
+    for (flag, names) in [
+        ("-encoders", vec![encoder, "aac"]),
+        ("-filters", filters),
+    ] {
+        let mut cmd = tokio::process::Command::new(ffmpeg);
+        cmd.args(["-hide_banner", flag]).kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+            .await.map_err(|_| "检查 FFmpeg 能力超时".to_string())?
+            .map_err(|e| format!("检查 FFmpeg 能力失败: {}", e))?;
+        if !output.status.success() {
+            return Err("FFmpeg 无法列出编码器或滤镜，请检查组件".into());
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        for name in names {
+            if !text.lines().any(|line| line.split_whitespace().nth(1) == Some(name)) {
+                return Err(format!("FFmpeg 缺少 {}，请更新组件或选择其他压制方式", name));
+            }
+        }
+    }
+    // 列出编码器不代表当前版本接受所用参数；用相同参数编码一帧到 null，提前报错。
+    // 只生成内存中的黑帧，不读取片源、不写文件。
+    let mut probe_options = options.clone();
+    probe_options.video_stream = Some(0);
+    probe_options.include_audio = Some(false);
+    probe_options.silent_audio = false;
+    probe_options.tone_map = false;
+    probe_options.resolution = None;
+    probe_options.frame_rate = None;
+    probe_options.faststart = Some(false);
+    let mut args = build_args("color=c=black:s=128x128:r=24:d=0.05", Path::new("-"), &probe_options, None, None, None);
+    let input = args.iter().position(|arg| arg == "-i").unwrap();
+    args.splice(input..input, ["-f".into(), "lavfi".into()]);
+    args.pop();
+    args.extend(["-frames:v".into(), "1".into(), "-f".into(), "null".into(), "-".into()]);
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error"])
+        .args(args).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+        .await.map_err(|_| "检查压制参数超时，请检查 FFmpeg 组件".to_string())?
+        .map_err(|e| format!("检查压制参数失败: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("FFmpeg 无法使用当前压制参数，请更新组件或更换压制模式：{}",
+            String::from_utf8_lossy(&output.stderr).chars().take(2000).collect::<String>()));
+    }
+    Ok(())
 }
 
 impl TranscodeOptions {
@@ -413,11 +610,17 @@ pub fn build_args(
         args.extend(["-ss".into(), format!("{:.3}", s)]);
     }
     args.extend(["-i".into(), input.to_string()]);
+    if o.silent_audio {
+        args.extend(["-f".into(), "lavfi".into(), "-i".into(), "anullsrc=r=48000:cl=stereo".into()]);
+    }
 
     // ===== 视频轨 =====
     // 图形（位图）字幕烧录需要用 filter_complex 把字幕画面 overlay 到视频上，
     // 此时视频走滤镜输出 [v]，不能再单独 -map 原视频流。
     let scale_filter: Option<String> = match o.resolution.as_deref() {
+        Some("fit1080") => Some("scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease:force_divisible_by=2".into()),
+        Some("fit720") => Some("scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:force_divisible_by=2".into()),
+        Some("fit480") => Some("scale=w='min(iw,854)':h='min(ih,480)':force_original_aspect_ratio=decrease:force_divisible_by=2".into()),
         Some(res) if res != "original" && !res.is_empty() => {
             // 按高度缩放，宽度取偶数保持宽高比
             Some(format!("scale=-2:{}", res))
@@ -444,9 +647,13 @@ pub fn build_args(
 
     // ===== 音频轨 =====
     if o.include_audio() {
-        match o.audio_stream {
-            Some(i) => args.extend(["-map".into(), format!("0:{}", i)]),
-            None => args.extend(["-map".into(), "0:a:0?".into()]),
+        if o.silent_audio {
+            args.extend(["-map".into(), "1:a:0".into()]);
+        } else {
+            match o.audio_stream {
+                Some(i) => args.extend(["-map".into(), format!("0:{}", i)]),
+                None => args.extend(["-map".into(), "0:a:0?".into()]),
+            }
         }
     }
 
@@ -485,6 +692,9 @@ pub fn build_args(
             // libsvtav1 的 -preset 是整数档位（-2..13，越大越快），默认取偏快的档位
             let preset = o.preset.as_deref().and_then(svtav1_preset).unwrap_or(8);
             args.extend(["-preset".into(), preset.to_string()]);
+            if o.streaming_profile == Some(StreamingProfile::Av1) {
+                args.extend(["-svtav1-params".into(), "tune=0:mbr-overshoot-pct=10".into()]);
+            }
         }
         let crf = o.crf.unwrap_or(20).min(51);
         args.extend(["-crf".into(), crf.to_string()]);
@@ -505,14 +715,31 @@ pub fn build_args(
         if let Some(gop) = o.keyframe_interval.filter(|g| *g > 0) {
             args.extend(["-g".into(), gop.to_string()]);
             if x26x {
-                args.extend(["-keyint_min".into(), gop.to_string(), "-sc_threshold".into(), "0".into()]);
+                if o.streaming_profile == Some(StreamingProfile::Compatible) {
+                    // 两秒为最大间隔，场景切换可提前插入关键帧。
+                    args.extend(["-keyint_min".into(), "1".into(), "-sc_threshold".into(), "40".into()]);
+                } else {
+                    args.extend(["-keyint_min".into(), gop.to_string(), "-sc_threshold".into(), "0".into()]);
+                }
             }
+        }
+        if o.streaming_profile == Some(StreamingProfile::Compatible) {
+            args.extend(["-profile:v".into(), "main".into(), "-level:v".into(), "4.1".into(), "-flags".into(), "+cgop".into()]);
+            // slow 默认的 5 个参考帧超出 1080P Level 4.1 DPB；限制为 4。
+            args.extend(["-refs".into(), "4".into(), "-aq-mode".into(), "3".into(), "-aq-strength".into(), "1.0".into()]);
+        }
+        if let Some(fps) = &o.frame_rate {
+            args.extend(["-r".into(), fps.clone(), "-fps_mode".into(), "cfr".into()]);
         }
     }
 
     // ===== 视频滤镜：缩放 + 文本字幕烧录（图形字幕已在上面的 filter_complex 中处理）=====
     if !graphic_burn {
         let mut vf: Vec<String> = Vec::new();
+        if o.tone_map {
+            let pix = if o.pix_fmt.as_deref() == Some("yuv420p10le") { "yuv420p10le" } else { "yuv420p" };
+            vf.push(format!("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format={},sidedata=mode=delete", pix));
+        }
         if let Some(sc) = &scale_filter {
             vf.push(sc.clone());
         }
@@ -525,6 +752,9 @@ pub fn build_args(
             args.extend(["-vf".into(), vf.join(",")]);
         }
     }
+    if o.tone_map {
+        args.extend(["-color_primaries".into(), "bt709".into(), "-color_trc".into(), "bt709".into(), "-colorspace".into(), "bt709".into(), "-color_range".into(), "tv".into()]);
+    }
 
     // ===== 音频编码 =====
     if o.include_audio() {
@@ -534,6 +764,9 @@ pub fn build_args(
             args.extend(["-c:a".into(), "aac".into()]);
             let br = o.audio_bitrate.as_deref().unwrap_or("192k");
             args.extend(["-b:a".into(), br.to_string()]);
+            if o.streaming_profile.is_some() {
+                args.extend(["-profile:a".into(), "aac_low".into()]);
+            }
         }
         // 直拷时不能再改声道 / 采样率
         if !o.audio_copy() {
@@ -557,6 +790,9 @@ pub fn build_args(
 
     if o.faststart() {
         args.extend(["-movflags".into(), "+faststart".into()]);
+    }
+    if o.silent_audio {
+        args.push("-shortest".into());
     }
     args.extend(["-progress".into(), "pipe:1".into(), "-nostats".into()]);
     if let Some(d) = dur_sec {
@@ -585,6 +821,139 @@ mod tests {
             audio_mode: Some("aac".into()),
             ..Default::default()
         }
+    }
+
+    fn streaming_source() -> serde_json::Value {
+        serde_json::json!({"streams": [
+            {"index":0,"codec_type":"video","codec_name":"hevc","width":3840,"height":2160,"avg_frame_rate":"60000/1001","pix_fmt":"yuv420p10le"},
+            {"index":1,"codec_type":"audio","codec_name":"ac3","channels":6,"sample_rate":"44100"}
+        ]})
+    }
+
+    #[test]
+    fn compatible_streaming_preset_is_bounded_and_uses_common_codecs() {
+        let o = streaming_options(StreamingProfile::Compatible, &streaming_source(), &Default::default()).unwrap();
+        let args = build_args("in.mkv", Path::new("out.mp4"), &o, None, None, None).join(" ");
+        for expected in ["-c:v libx264", "-profile:v main", "-level:v 4.1", "-crf 22", "-preset slow", "-pix_fmt yuv420p", "-r 30", "-c:a aac", "-profile:a aac_low", "-ac 2", "-ar 48000", "-maxrate 8000k", "-g 60", "-keyint_min 1", "-sc_threshold 40", "-refs 4", "-aq-mode 3", "+faststart", "force_divisible_by=2"] {
+            assert!(args.contains(expected), "missing {}: {}", expected, args);
+        }
+        assert_eq!(output_label(&o), "兼容 H264");
+        assert!(!o.silent_audio && !o.tone_map);
+    }
+
+    #[test]
+    fn streaming_preserves_low_frame_rate_and_has_separate_av1_settings() {
+        let mut source = streaming_source();
+        source["streams"][0]["avg_frame_rate"] = "0/0".into();
+        source["streams"][0]["r_frame_rate"] = "24000/1001".into();
+        source["streams"][0]["height"] = 720.into();
+        let compatible = streaming_options(StreamingProfile::Compatible, &source, &Default::default()).unwrap();
+        assert_eq!(compatible.frame_rate.as_deref(), Some("24000/1001"));
+        assert_eq!(compatible.keyframe_interval, Some(48));
+        assert_eq!(compatible.max_video_bitrate.as_deref(), Some("4000k"));
+        for preset in [6, 8, 10, 99] {
+            let mut settings = crate::settings::Settings::default();
+            settings.streaming_av1_preset = preset;
+            let av1 = streaming_options(StreamingProfile::Av1, &source, &settings).unwrap();
+            assert_eq!(av1.preset, Some(if preset == 99 { "8".into() } else { preset.to_string() }));
+            assert_eq!(av1.max_video_bitrate.as_deref(), Some("3000k"));
+            assert!(av1.frame_rate.is_none());
+            let args = build_args("in.mkv", Path::new("out.mp4"), &av1, None, None, None).join(" ");
+            assert!(args.contains("-c:v libsvtav1"));
+            assert!(args.contains("-svtav1-params tune=0:mbr-overshoot-pct=10"));
+            assert!(!args.contains("-bufsize"));
+            assert!(!args.contains("-keyint_min") && !args.contains("-sc_threshold"));
+        }
+    }
+
+    #[test]
+    fn low_bitrate_resolution_policy_keeps_budget_and_can_be_disabled() {
+        let source = streaming_source();
+        for (profile, budget, resolution) in [
+            (StreamingProfile::Compatible, 1.0, "fit480"),
+            (StreamingProfile::Compatible, 1.5, "fit480"),
+            (StreamingProfile::Compatible, 2.0, "fit720"),
+            (StreamingProfile::Compatible, 3.0, "fit720"),
+            (StreamingProfile::Compatible, 3.01, "fit1080"),
+            (StreamingProfile::Av1, 1.5, "fit720"),
+            (StreamingProfile::Av1, 2.0, "fit720"),
+            (StreamingProfile::Av1, 3.0, "fit1080"),
+        ] {
+            let mut settings = crate::settings::Settings::default();
+            settings.streaming_auto_resolution = true;
+            settings.compatible_1080p_bitrate_mbps = budget;
+            settings.streaming_1080p_bitrate_mbps = budget;
+            // 降分辨率之后不可又改用 720P 档的另一个码率预算。
+            settings.compatible_720p_bitrate_mbps = 40.0;
+            settings.streaming_720p_bitrate_mbps = 40.0;
+            let options = streaming_options(profile, &source, &settings).unwrap();
+            assert_eq!(options.resolution.as_deref(), Some(resolution));
+            assert_eq!(options.max_video_bitrate, Some(format!("{}k", (budget * 1000.0).round() as u32)));
+            assert_eq!(options.audio_bitrate.as_deref(), Some(if budget <= 3.0 { "128k" } else { "160k" }));
+            let args = build_args("in.mkv", Path::new("out.mp4"), &options, None, None, None).join(" ");
+            assert!(args.contains("force_divisible_by=2"));
+            settings.streaming_auto_resolution = false;
+            let preserved = streaming_options(profile, &source, &settings).unwrap();
+            assert_eq!(preserved.resolution.as_deref(), Some("fit1080"));
+            if profile == StreamingProfile::Av1 {
+                assert!(preserved.frame_rate.is_none());
+            } else {
+                assert_eq!(preserved.frame_rate.as_deref(), Some("30"));
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_budgets_follow_fitted_pixels_and_invalid_settings_are_safe() {
+        let mut source = streaming_source();
+        source["streams"][0]["width"] = 720.into();
+        source["streams"][0]["height"] = 1280.into();
+        let mut settings = crate::settings::Settings::default();
+        let portrait = streaming_options(StreamingProfile::Compatible, &source, &settings).unwrap();
+        assert_eq!(portrait.max_video_bitrate.as_deref(), Some("4000k"));
+        settings.compatible_720p_bitrate_mbps = f64::NAN;
+        settings.compatible_preset = "veryslow".into();
+        let invalid = streaming_options(StreamingProfile::Compatible, &source, &settings).unwrap();
+        assert_eq!(invalid.max_video_bitrate.as_deref(), Some("4000k"));
+        assert_eq!(invalid.preset.as_deref(), Some("slow"));
+        settings.compatible_preset = "medium".into();
+        assert_eq!(streaming_options(StreamingProfile::Compatible, &source, &settings).unwrap().preset.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn streaming_hdr_is_tonemapped_and_unknown_hdr_is_rejected() {
+        let mut source = streaming_source();
+        source["streams"][0]["color_primaries"] = "bt2020".into();
+        for transfer in ["smpte2084", "arib-std-b67"] {
+            source["streams"][0]["color_transfer"] = transfer.into();
+            let o = streaming_options(StreamingProfile::Compatible, &source, &Default::default()).unwrap();
+            assert!(o.tone_map);
+            let args = build_args("in.mkv", Path::new("out.mp4"), &o, None, None, None).join(" ");
+            assert!(args.contains("tonemap=") && args.contains("-color_trc bt709"));
+        }
+        source["streams"][0]["color_transfer"] = "unknown".into();
+        assert!(streaming_options(StreamingProfile::Compatible, &source, &Default::default()).is_err());
+        source["streams"][0]["color_transfer"] = "smpte2084".into();
+        source["streams"][0]["side_data_list"] = serde_json::json!([{"side_data_type":"DOVI configuration record"}]);
+        assert!(streaming_options(StreamingProfile::Compatible, &source, &Default::default()).is_err());
+    }
+
+    #[test]
+    fn streaming_handles_silent_sources_and_level_limits() {
+        let mut source = streaming_source();
+        source["streams"].as_array_mut().unwrap().pop();
+        let mut settings = crate::settings::Settings::default();
+        settings.compatible_1080p_bitrate_mbps = 100.0;
+        let o = streaming_options(StreamingProfile::Compatible, &source, &settings).unwrap();
+        assert!(o.silent_audio);
+        assert_eq!(o.max_video_bitrate.as_deref(), Some("50000k"));
+        assert_eq!(o.video_buffer_size.as_deref(), Some("62500k"));
+        let args = build_args("in.mkv", Path::new("out.mp4"), &o, None, None, None).join(" ");
+        assert!(args.contains("anullsrc=") && args.contains("-map 1:a:0") && args.contains("-shortest"));
+        let old: TranscodeOptions = serde_json::from_str("{}").unwrap();
+        assert!(old.streaming_profile.is_none() && !old.silent_audio && !old.tone_map);
+        assert_eq!(output_label(&old), "转码");
+        assert!(streaming_options(StreamingProfile::Compatible, &serde_json::json!({"streams":[]}), &settings).is_err());
     }
 
     #[test]

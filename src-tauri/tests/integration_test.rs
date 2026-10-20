@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use app_lib::http_server::HttpServer;
 use app_lib::media_library::Db;
-use app_lib::settings::{Settings, UrlMode};
+use app_lib::settings::{CloseBehavior, ListenMode, Settings, UrlMode};
 use app_lib::url_builder::{build_media_url, UrlInput};
 
 fn setup() -> (HttpServer, app_lib::media_library::MediaItem, PathBufWrap, String) {
@@ -400,6 +400,12 @@ fn test_settings_persistence() {
     let file = dir.join("settings.json");
 
     assert_eq!(Settings::default().port, 17001);
+    let old_settings: Settings = serde_json::from_str(r#"{"port":17001}"#).unwrap();
+    assert_eq!(old_settings.streaming_av1_preset, 8);
+    assert!(!old_settings.streaming_auto_resolution);
+    assert_eq!(old_settings.compatible_preset, "slow");
+    assert_eq!(old_settings.compatible_720p_bitrate_mbps, 4.0);
+    assert_eq!(old_settings.compatible_1080p_bitrate_mbps, 8.0);
     assert_eq!(Settings::load(&file).unwrap().port, 17001);
     std::fs::write(&file, "{}").unwrap();
     assert_eq!(Settings::load(&file).unwrap().port, 17001);
@@ -407,14 +413,19 @@ fn test_settings_persistence() {
     assert_eq!(Settings::load(&file).unwrap().port, 8080);
     let mut s = Settings::default();
     s.port = 9999;
+    s.streaming_auto_resolution = true;
+    s.compatible_preset = "medium".into();
     s.easytier_ip = "10.0.0.1".to_string();
     s.save(&file).unwrap();
+    let saved = Settings::load(&file).unwrap();
+    assert!(saved.streaming_auto_resolution);
+    assert_eq!(saved.compatible_preset, "medium");
 
     let loaded = Settings::load(&file).unwrap();
     assert_eq!(loaded.port, 9999);
     assert_eq!(loaded.easytier_ip, "10.0.0.1");
 
-    std::fs::write(&file, r#"{"listenMode":"custom","defaultUrlMode":"easytier","customIp":"10.0.0.1","port":23456,"defaultPlayerPath":"player.exe","defaultPlayerArgs":"{path}"}"#).unwrap();
+    std::fs::write(&file, r#"{"listenMode":"custom","allowPeerView":true,"defaultUrlMode":"easytier","customIp":"10.0.0.1","port":23456,"defaultPlayerPath":"player.exe","defaultPlayerArgs":"{path}"}"#).unwrap();
     let migrated = Settings::load(&file).unwrap();
     assert_eq!(migrated.bind_ip(), "0.0.0.0");
     assert_eq!(migrated.default_url_mode, UrlMode::Lan);
@@ -431,4 +442,39 @@ fn test_settings_persistence() {
     assert!(Settings::load(&file).is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_upstream_settings_migration_preserves_compression_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    std::fs::write(&file, r#"{
+        "listenMode":"custom",
+        "defaultUrlMode":"easytier",
+        "closeBehavior":"tray",
+        "streamingAv1Preset":6,
+        "compatible720pBitrateMbps":5.25,
+        "compatible1080pBitrateMbps":9.5
+    }"#).unwrap();
+
+    let mut migrated = Settings::load(&file).unwrap();
+    assert_eq!(migrated.listen_mode, ListenMode::Loopback);
+    assert_eq!(migrated.default_url_mode, UrlMode::Localhost);
+    assert_eq!(migrated.close_behavior, CloseBehavior::Ask);
+    assert_eq!(migrated.settings_revision, Settings::default().settings_revision);
+    assert_eq!(migrated.streaming_av1_preset, 6);
+    assert_eq!(migrated.compatible_720p_bitrate_mbps, 5.25);
+    assert_eq!(migrated.compatible_1080p_bitrate_mbps, 9.5);
+
+    migrated.close_behavior = CloseBehavior::Tray;
+    migrated.allow_peer_view = true;
+    migrated.listen_mode = ListenMode::Lan;
+    migrated.save(&file).unwrap();
+    let loaded = Settings::load(&file).unwrap();
+    assert_eq!(loaded.close_behavior, CloseBehavior::Tray);
+    assert_eq!(loaded.listen_mode, ListenMode::Lan);
+    assert_eq!(loaded.default_url_mode, UrlMode::Lan);
+    assert_eq!(loaded.streaming_av1_preset, 6);
+    assert_eq!(loaded.compatible_720p_bitrate_mbps, 5.25);
+    assert_eq!(loaded.compatible_1080p_bitrate_mbps, 9.5);
 }

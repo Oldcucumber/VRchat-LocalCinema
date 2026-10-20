@@ -142,6 +142,10 @@ impl ConvertQueue {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.tasks.iter().any(|t| {
             t.media_id == media_id && matches!(t.state, TaskState::Queued | TaskState::Running)
+                && match (t.options.streaming_profile, options.streaming_profile) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
         }) {
             return Err("该视频已在转码队列中".into());
         }
@@ -568,6 +572,19 @@ impl ConvertQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_profiles_can_coexist_but_same_profile_is_deduplicated() {
+        use crate::transcode::StreamingProfile;
+        let q = ConvertQueue::default();
+        for profile in [StreamingProfile::Av1, StreamingProfile::Compatible] {
+            let o = TranscodeOptions { streaming_profile: Some(profile), ..Default::default() };
+            assert!(q.enqueue("m1".into(), "A".into(), false, o.clone()).is_ok());
+            assert!(q.enqueue("m1".into(), "A".into(), false, o).is_err());
+        }
+        assert_eq!(q.list().len(), 2);
+        assert!(q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).is_err());
+    }
 
     #[test]
     fn test_enqueue_dedup_and_start_now() {

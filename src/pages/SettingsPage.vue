@@ -69,6 +69,11 @@ const form = reactive<Settings>({
   disablePowerThrottling: true,
   streaming720pBitrateMbps: 3,
   streaming1080pBitrateMbps: 6,
+  streamingAv1Preset: 8,
+  streamingAutoResolution: false,
+  compatiblePreset: 'slow',
+  compatible720pBitrateMbps: 4,
+  compatible1080pBitrateMbps: 8,
   easytier: {
     protocols: ['tcp', 'ws'],
     peerUrl: '',
@@ -170,6 +175,14 @@ const ready = ref(false)
 /// 外部同步（settingsCache → form）期间暂停自动保存，防止回声
 const syncing = ref(false)
 let saveTimer: number | null = null
+let savePending = false
+let ownCacheUpdate: Settings | null = null
+let lastPersistedSettings: Settings | null = null
+
+function snapshotSettings(settings: Settings): Settings {
+  return JSON.parse(JSON.stringify(settings)) as Settings
+}
+
 const appPaths = ref<AppPaths | null>(null)
 const players = ref<PlayerInfo[]>([])
 
@@ -206,17 +219,26 @@ const playerOptions = computed(() => {
 })
 
 /// 端口无效时暂停自动保存，由行内提示纠错
-const portInvalid = computed(() => form.port < 1 || form.port > 65535)
+const portInvalid = computed(() => !Number.isInteger(form.port) || form.port < 1 || form.port > 65535)
 
 /// 其他页面改动设置后（左下角快捷开关、关闭弹窗「不再提示」、组网页保存等）
 /// 表单实时跟随刷新，避免显示滞后；同步期间暂停自动保存，防止回声。
 /// 注意：需定义在 listenMode watcher 之前，保证同批触发时 syncing 先行置位
 watch(settingsCache, (s) => {
-  if (!s) return
+  if (!s || s === ownCacheUpdate) return
+  // 快捷开关或关闭确认更新配置时，保留本页尚未提交的压制参数等修改。
+  const persisted = lastPersistedSettings
+  const pendingEdits = ready.value && persisted
+    ? Object.fromEntries(Object.entries(form).filter(([key, value]) =>
+      JSON.stringify(value) !== JSON.stringify(persisted[key as keyof Settings])
+    ))
+    : {}
   syncing.value = true
-  Object.assign(form, s)
+  Object.assign(form, s, pendingEdits)
+  lastPersistedSettings = snapshotSettings(s)
   void nextTick(() => {
     syncing.value = false
+    if (Object.keys(pendingEdits).length) scheduleSave()
   })
 })
 
@@ -224,7 +246,7 @@ watch(() => form.listenMode, (mode, prev) => {
   form.defaultUrlMode = mode === 'lan' ? 'lan' : 'localhost'
   if (mode === 'lan' && prev !== 'lan' && !syncing.value) {
     toast.info('已切换到局域网模式')
-    if (largeMediaItems.value.length) toast.warning(`媒体库有 ${largeMediaItems.value.length} 个 2 GB 以上视频；开放局域网分享前建议压制为流媒体 MP4`)
+    if (largeMediaItems.value.length) toast.info(`媒体库有 ${largeMediaItems.value.length} 个 2 GB 以上视频；开放局域网分享前建议压制为流媒体 MP4`)
   }
 })
 
@@ -278,7 +300,7 @@ function clampBitrate(v: number): number {
   if (!Number.isFinite(v)) return 1
   return Math.min(100, Math.max(1, Math.round(v * 100) / 100))
 }
-function setBitrate(key: 'streaming720pBitrateMbps' | 'streaming1080pBitrateMbps', raw: string) {
+function setBitrate(key: 'streaming720pBitrateMbps' | 'streaming1080pBitrateMbps' | 'compatible720pBitrateMbps' | 'compatible1080pBitrateMbps', raw: string) {
   if (raw.trim() === '') return
   form[key] = clampBitrate(Number(raw))
 }
@@ -351,6 +373,7 @@ async function browseDownloadDir() {
 
 /// 所有设置项修改即应用：表单任意变化防抖后整体保存（端口等网络项变化会触发服务自动重启）
 function scheduleSave() {
+  savePending = true
   if (saveTimer !== null) window.clearTimeout(saveTimer)
   saveTimer = window.setTimeout(() => {
     saveTimer = null
@@ -359,24 +382,35 @@ function scheduleSave() {
 }
 
 async function persist() {
-  if (!ready.value || syncing.value || saving.value) return
+  if (!ready.value || syncing.value) return
   if (portInvalid.value) return
+  if (saving.value) {
+    savePending = true
+    return
+  }
+  savePending = false
   form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
   form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
+  form.compatible720pBitrateMbps = clampBitrate(form.compatible720pBitrateMbps)
+  form.compatible1080pBitrateMbps = clampBitrate(form.compatible1080pBitrateMbps)
+  const snapshot = snapshotSettings(form)
   saving.value = true
   // 保存很快（仅写配置）时不打扰；只有重启 HTTP 服务等耗时操作才显示遮罩
   const slow = window.setTimeout(() => {
     applyingOpen.value = true
   }, 250)
   try {
-    await saveSettings({ ...form })
-    settingsCache.value = { ...form }
+    await saveSettings(snapshot)
+    lastPersistedSettings = snapshot
+    settingsCache.value = snapshot
+    ownCacheUpdate = settingsCache.value
   } catch (e) {
     toast.error(errMsg(e))
   } finally {
     window.clearTimeout(slow)
     applyingOpen.value = false
     saving.value = false
+    if (savePending) scheduleSave()
   }
 }
 
@@ -398,6 +432,7 @@ async function reset() {
   if (!ok) return
   try {
     const s = await resetSettings()
+    lastPersistedSettings = snapshotSettings(s)
     Object.assign(form, s)
     form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
     form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
@@ -480,7 +515,7 @@ async function doClearConvertCache() {
     // 转码产物记录已删除，重新拉取媒体库列表
     mediaStore.items = await listMedia()
     toast.success(
-      `已清除 ${r.removed_files} 个文件（释放 ${formatSize(r.freed_bytes)}），移除 ${r.removed_records} 条转码产物记录`
+      `已清除 ${r.removedFiles} 个文件（释放 ${formatSize(r.freedBytes)}），移除 ${r.removedRecords} 条转码产物记录`
     )
   } catch (e) {
     toast.error(errMsg(e))
@@ -500,6 +535,7 @@ onMounted(async () => {
       detectPlayers().catch(() => [] as PlayerInfo[]),
     ])
     Object.assign(form, s)
+    lastPersistedSettings = snapshotSettings(s)
     // 兼容历史配置：KCP 与 QUIC 代理互斥，同时开启时保留 KCP
     if (form.easytier.kcpProxy && form.easytier.quicProxy) form.easytier.quicProxy = false
     form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
@@ -523,6 +559,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlistenProgress?.()
+  if (saveTimer !== null) window.clearTimeout(saveTimer)
+  if (savePending) void persist()
 })
 </script>
 
@@ -823,8 +861,30 @@ onUnmounted(() => {
     </CollapsibleCard>
 
     <CollapsibleCard title="一键压制" :open="openGroup === 'transcode'" @update:open="(v) => setGroup('transcode', v)">
+      <p class="text-xs text-muted-foreground">AV1 适合节省体积；兼容模式输出 H.264 Main 4.1、8-bit 420、AAC-LC 双声道 48kHz，最高 1080P / 30fps。Windows N/KN 等缺少媒体功能组件时仍可能需要安装 Media Feature Pack，不保证所有播放器均可播放。</p>
       <div class="space-y-1.5">
-        <Label>720P 码率（Mbps）</Label>
+        <Label>AV1 压制速度</Label>
+        <Select
+          :model-value="String(form.streamingAv1Preset)"
+          :options="[{ value: '10', label: '快速' }, { value: '8', label: '均衡（默认）' }, { value: '6', label: '画质优先（较慢）' }]"
+          @update:model-value="form.streamingAv1Preset = Number($event)"
+        />
+        <p class="text-xs text-muted-foreground">较慢档位倾向于提高压缩效率，但不保证文件一定更小；AV1 与 H.264 的 CRF 数字不能直接比较。</p>
+      </div>
+      <div class="space-y-1.5">
+        <Label>H.264 压制速度</Label>
+        <Select :model-value="form.compatiblePreset" :options="[{ value: 'medium', label: '均衡' }, { value: 'slow', label: '画质优先（默认）' }]" @update:model-value="form.compatiblePreset = $event as 'medium' | 'slow'" />
+        <p class="text-xs text-muted-foreground">较慢档位增加编码时间；已保存的 AV1 速度选择会保留。</p>
+      </div>
+      <div class="flex items-center justify-between gap-4">
+        <div class="space-y-1.5">
+          <Label>低码率自动调整画面</Label>
+          <p class="text-xs text-muted-foreground">默认关闭。开启后按视频码率预算降低分辨率，3 Mbps 及以下最高 30fps，可能损失文字和细节。关闭时仍最高 1080P；兼容 H.264 始终最高 30fps。</p>
+        </div>
+        <Switch v-model:checked="form.streamingAutoResolution" />
+      </div>
+      <div class="space-y-1.5">
+        <Label>AV1 · 720P 档视频码率上限（Mbps）</Label>
         <Input
           type="number"
           :min="1"
@@ -834,11 +894,11 @@ onUnmounted(() => {
           class="w-32"
           @update:model-value="setBitrate('streaming720pBitrateMbps', $event)"
         />
-        <p class="text-xs text-muted-foreground">720p 及以下源文件的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 3）</p>
+        <p class="text-xs text-muted-foreground">按源画面缩入 1080P 后的像素量选档：不超过 1280×720 使用此预算；CRF 28，默认 3 Mbps。SVT-AV1 使用 capped CRF，实际码率可能超调。</p>
       </div>
       <Separator />
       <div class="space-y-1.5">
-        <Label>1080P+ 码率（Mbps）</Label>
+        <Label>AV1 · 1080P 档视频码率上限（Mbps）</Label>
         <Input
           type="number"
           :min="1"
@@ -848,7 +908,16 @@ onUnmounted(() => {
           class="w-32"
           @update:model-value="setBitrate('streaming1080pBitrateMbps', $event)"
         />
-        <p class="text-xs text-muted-foreground">高于 720p 源文件（含降采样到 1080p）的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 6）</p>
+        <p class="text-xs text-muted-foreground">较大画面使用此预算，默认 6 Mbps。选档后自动调整画面不会再次切换预算；网络传输还包含音频及协议开销。</p>
+      </div>
+      <Separator />
+      <div class="space-y-1.5">
+        <Label>兼容 H.264 · 720P / 1080P 档视频码率上限（Mbps）</Label>
+        <div class="flex gap-2">
+          <Input type="number" :min="1" :max="100" :step="0.01" :model-value="String(form.compatible720pBitrateMbps)" class="w-32" aria-label="兼容模式 720P 码率" @update:model-value="setBitrate('compatible720pBitrateMbps', $event)" />
+          <Input type="number" :min="1" :max="100" :step="0.01" :model-value="String(form.compatible1080pBitrateMbps)" class="w-32" aria-label="兼容模式 1080P 码率" @update:model-value="setBitrate('compatible1080pBitrateMbps', $event)" />
+        </div>
+        <p class="text-xs text-muted-foreground">默认 4 / 8 Mbps、CRF 22；采用暗部自适应量化，场景切换可提前插入关键帧。兼容模式最高按 50 Mbps 生效，3 Mbps 及以下音频使用 AAC 128k，其余为 160k。</p>
       </div>
     </CollapsibleCard>
 

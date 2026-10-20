@@ -65,11 +65,11 @@ function doTranscode() {
       <section class="rounded-md border border-border p-3">
         <h3 class="mb-1 flex items-center gap-1.5 font-medium">
           <FileVideo class="h-4 w-4" />
-          方案一 · 用本软件转码为 AAC（推荐，100% 可靠）
+          方案一 · 用本软件转码为 AAC（视频本身须兼容）
         </h3>
         <p class="text-muted-foreground">
-          把音轨转成 AAC、视频原样直拷（画质无损、速度快）。转出的新视频可直接在 VRChat 播放，
-          无需安装任何系统组件。
+          把音轨转成 AAC、视频原样直拷（画质无损、速度快），避免依赖 Dolby 音频扩展。
+          若视频本身也缺少 AV1 / HEVC 解码器，请改用媒体卡片右键的「兼容压制（H.264）」。
         </p>
         <Button size="sm" class="mt-2" @click="doTranscode">
           <FileVideo class="h-3.5 w-3.5" />

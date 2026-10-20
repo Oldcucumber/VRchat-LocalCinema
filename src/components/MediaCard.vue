@@ -43,8 +43,8 @@ import {
   generateSample,
   audioDecoderMissingCached,
   openUrl,
-  transcodeMedia,
   type MediaItem,
+  type StreamingProfile,
   type UrlMode,
 } from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
@@ -175,9 +175,9 @@ function doTranscodeAudio() {
 }
 
 /// 一键压制为流媒体 MP4：默认 SVT-AV1（不提升分辨率与码率），产物在转换缓存目录并自动入库为新卡片
-async function doStreamingTranscode() {
+async function doStreamingTranscode(profile: StreamingProfile = 'av1') {
   try {
-    await transcodeStreamingItem(props.item)
+    await transcodeStreamingItem(props.item, profile)
     toast.info('已加入流媒体 MP4 压制队列，完成后请使用新卡片播放')
   } catch (e) {
     toast.error(errMsg(e))
@@ -324,12 +324,18 @@ const menuItems = computed<MenuEntry[]>(() => {
       icon: FileVideo,
       onSelect: doTranscode,
     },
-    // 一键压制为流媒体 MP4：适合网络播放的 H.264/AAC 组合
+    // 保留省流模式，另提供不依赖 AV1 / HEVC / Dolby 扩展的兼容模式。
     {
       type: 'item',
-      label: '一键压制为流媒体 MP4',
+      label: '省流压制（AV1）',
       icon: Zap,
-      onSelect: doStreamingTranscode,
+      onSelect: () => doStreamingTranscode('av1'),
+    },
+    {
+      type: 'item',
+      label: '兼容压制（H.264）',
+      icon: Zap,
+      onSelect: () => doStreamingTranscode('compatible'),
     },
     // 本机缺少 AC-3/E-AC-3 解码器时提供引导（转码为 AAC / 安装解码器）
     ...(decoderWarning.value

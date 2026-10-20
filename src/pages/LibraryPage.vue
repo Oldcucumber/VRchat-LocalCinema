@@ -61,7 +61,6 @@ import {
 } from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
-import { formatDuration } from '../lib/format'
 
 const search = ref('')
 const sortBy = ref<'addedAt' | 'title' | 'fileSize' | 'durationMs'>('addedAt')

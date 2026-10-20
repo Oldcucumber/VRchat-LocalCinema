@@ -25,7 +25,7 @@ import {
   type ComponentDownloadProgress,
   type UnlistenFn,
 } from '../lib/api'
-import { serverStore, mediaStore, largeMediaItems, applyServerStatus, loadSettings, settingsCache, lanListenAvailable, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
+import { serverStore, largeMediaItems, applyServerStatus, loadSettings, settingsCache, lanListenAvailable, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
 import { confirmDialog } from '../lib/confirm'
 import { formatTime } from '../lib/format'
 import { toast, errMsg } from '../lib/toast'

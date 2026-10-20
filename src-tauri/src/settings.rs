@@ -96,6 +96,26 @@ fn default_streaming_1080p_bitrate_mbps() -> f64 {
     6.0
 }
 
+fn default_streaming_av1_preset() -> u32 {
+    8
+}
+
+fn default_streaming_auto_resolution() -> bool {
+    false
+}
+
+fn default_compatible_preset() -> String {
+    "slow".into()
+}
+
+fn default_compatible_720p_bitrate_mbps() -> f64 {
+    4.0
+}
+
+fn default_compatible_1080p_bitrate_mbps() -> f64 {
+    8.0
+}
+
 /// EasyTier 组网配置，对应 easytier-core 的命令行参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -214,6 +234,20 @@ pub struct Settings {
     /// 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数）
     #[serde(default = "default_streaming_1080p_bitrate_mbps", rename = "streaming1080pBitrateMbps")]
     pub streaming_1080p_bitrate_mbps: f64,
+    /// AV1 压制速度：10 快速 / 8 均衡（缺省） / 6 画质优先
+    #[serde(default = "default_streaming_av1_preset")]
+    pub streaming_av1_preset: u32,
+    /// 可选的低码率缩小画面，AV1 同时限制为最高 30fps；缺省关闭以保留细节和源帧率。
+    #[serde(default = "default_streaming_auto_resolution")]
+    pub streaming_auto_resolution: bool,
+    /// H.264 编码速度：medium / slow，引用帧数由编码参数另行限制。
+    #[serde(default = "default_compatible_preset")]
+    pub compatible_preset: String,
+    /// 兼容模式独立的视频码率上限；编码时另按 Main Level 4.1 约束
+    #[serde(default = "default_compatible_720p_bitrate_mbps", rename = "compatible720pBitrateMbps")]
+    pub compatible_720p_bitrate_mbps: f64,
+    #[serde(default = "default_compatible_1080p_bitrate_mbps", rename = "compatible1080pBitrateMbps")]
+    pub compatible_1080p_bitrate_mbps: f64,
     /// EasyTier 组网配置
     pub easytier: EasytierConfig,
 }
@@ -244,6 +278,11 @@ impl Default for Settings {
             disable_power_throttling: default_disable_power_throttling(),
             streaming_720p_bitrate_mbps: default_streaming_720p_bitrate_mbps(),
             streaming_1080p_bitrate_mbps: default_streaming_1080p_bitrate_mbps(),
+            streaming_av1_preset: default_streaming_av1_preset(),
+            streaming_auto_resolution: default_streaming_auto_resolution(),
+            compatible_preset: default_compatible_preset(),
+            compatible_720p_bitrate_mbps: default_compatible_720p_bitrate_mbps(),
+            compatible_1080p_bitrate_mbps: default_compatible_1080p_bitrate_mbps(),
             easytier: EasytierConfig::default(),
         }
     }

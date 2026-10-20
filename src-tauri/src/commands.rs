@@ -2375,10 +2375,25 @@ pub async fn transcode_media(
     if state.hls_jobs.read().unwrap_or_else(|e| e.into_inner()).contains(&id) {
         return Err(AppError::Msg("该视频正在边转边播，请等待完成或先取消".into()));
     }
-    let options = options.unwrap_or_default();
+    let mut options = options.unwrap_or_default();
+    if let Some(profile) = options.streaming_profile {
+        let settings = state.current_settings();
+        let (ffprobe, _) = components::ffprobe_binary(&settings, &state.paths);
+        let (ffmpeg, _) = components::ffmpeg_binary(&settings, &state.paths);
+        let ffprobe = ffprobe.ok_or_else(|| AppError::Msg("一键压制需要 FFprobe，请先安装或配置组件".into()))?;
+        let ffmpeg = ffmpeg.ok_or_else(|| AppError::Msg("一键压制需要 FFmpeg，请先安装或配置组件".into()))?;
+        let probe = thumbnail::probe_media_json(&ffprobe, Path::new(&item.file_path)).await?;
+        options = crate::transcode::streaming_options(profile, &probe, &settings).map_err(AppError::Msg)?;
+        crate::transcode::check_streaming_capabilities(&ffmpeg, &options).await.map_err(AppError::Msg)?;
+    }
+    let title = if options.streaming_profile.is_some() {
+        format!("{} · {}", item.title, crate::transcode::output_label(&options))
+    } else {
+        item.title
+    };
     let task = state
         .convert_queue
-        .enqueue(id, item.title, overwrite.unwrap_or(false), options)
+        .enqueue(id, title, overwrite.unwrap_or(false), options)
         .map_err(AppError::Msg)?;
     emit_convert_tasks(&app);
     Ok(task)
@@ -2720,7 +2735,7 @@ async fn run_queued_transcode(
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "video".into());
-    let out_name = format!("{} (转码).mp4", stem);
+    let out_name = format!("{} ({}).mp4", stem, crate::transcode::output_label(&task.options));
     // 用户确认覆盖时直接写同名文件（ffmpeg -y），否则追加序号避免覆盖
     let dest = if task.overwrite {
         dir.join(&out_name)
@@ -2847,6 +2862,7 @@ async fn prepare_transcode_options(
     let streams = if requested.video_copy()
         || requested.audio_copy()
         || requested.wants_subtitle()
+        || requested.streaming_profile.is_some()
     {
         let (ffprobe, _) = components::ffprobe_binary(&settings, &state.paths);
         match ffprobe {

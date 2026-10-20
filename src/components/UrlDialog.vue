@@ -13,6 +13,7 @@ import {
   listSegments,
   openUrl,
   type MediaItem,
+  type StreamingProfile,
   type UrlMode,
 } from '../lib/api'
 import { loadSettings, convertTaskStore, tunnelStore, transcodeStreamingItem, lanListenAvailable, lanUnavailableReason } from '../lib/store'
@@ -189,16 +190,20 @@ async function rebuild() {
   }
 }
 
-async function queueShareCompression() {
+const compressing = ref(false)
+async function queueShareCompression(profile: StreamingProfile) {
   const item = props.item
-  if (!item) return
+  if (!item || compressing.value) return
+  compressing.value = true
   try {
-    await transcodeStreamingItem(item)
+    await transcodeStreamingItem(item, profile)
     shareWarningOpen.value = false
     toast.info('已加入压制队列；继续复制原视频链接')
     await copyNow(true)
   } catch (e) {
     toast.error(errMsg(e))
+  } finally {
+    compressing.value = false
   }
 }
 
@@ -265,12 +270,13 @@ async function openInBrowser() {
     <Dialog
       :open="shareWarningOpen"
       title="分享大文件链接"
-      description="该视频超过 2 GB。局域网/公网播放受本机上传带宽影响，建议先压制为流媒体 MP4。"
+      description="该视频超过 2 GB，建议先压制。AV1 更省流量；不确定朋友是否有解码器时选兼容 H.264。此处仍复制原片链接，压制完成后请使用新卡片。"
       @update:open="shareWarningOpen = $event"
     >
       <div class="flex flex-wrap justify-end gap-2">
-        <Button variant="outline" @click="copyOriginal">仍复制原片链接</Button>
-        <Button @click="queueShareCompression">压制并继续复制</Button>
+        <Button variant="outline" :disabled="compressing" @click="copyOriginal">仍复制原片链接</Button>
+        <Button variant="outline" :disabled="compressing" @click="queueShareCompression('av1')">省流 AV1</Button>
+        <Button :disabled="compressing" @click="queueShareCompression('compatible')">兼容 H.264</Button>
       </div>
     </Dialog>
     <div class="space-y-4">
